@@ -1,11 +1,17 @@
 use dav1d_sys::*;
 
+use av_data::frame::{new_default_frame, Frame, FrameType, VideoInfo};
 use std::ffi::c_void;
 use std::fmt;
 use std::i64;
+use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
 use std::sync::Arc;
+
+#[cfg(feature = "codec-trait")]
+extern crate av_codec as codec;
+extern crate av_data as data;
 
 #[derive(Debug)]
 pub struct Error(i32);
@@ -29,9 +35,17 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<Error> for av_codec::error::Error {
+    // TODO
+    fn from(error: Error) -> Self {
+        av_codec::error::Error::InvalidData
+    }
+}
+
 #[derive(Debug)]
-pub struct Decoder {
+pub struct Decoder<T> {
     dec: *mut Dav1dContext,
+    private_data: PhantomData<T>,
 }
 
 unsafe extern "C" fn release_wrapped_data(_data: *const u8, cookie: *mut c_void) {
@@ -39,13 +53,55 @@ unsafe extern "C" fn release_wrapped_data(_data: *const u8, cookie: *mut c_void)
     closure();
 }
 
-impl Default for Decoder {
+impl<T> Default for Decoder<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decoder {
+fn frame_from_picture(pic: Picture) -> Frame {
+    use av_data::pixel::formats::{YUV420, YUV422, YUV444};
+
+    let format = match pic.pixel_layout() {
+        PixelLayout::I420 => YUV420,
+        PixelLayout::I422 => YUV422,
+        PixelLayout::I444 => YUV444,
+        PixelLayout::I400 => panic!("YUV400 not supported"),
+        PixelLayout::Unknown => panic!("Unknown pixel layout format"),
+    };
+
+    let video = VideoInfo::new(
+        pic.width() as usize,
+        pic.height() as usize,
+        false,
+        FrameType::OTHER,
+        Arc::new(*format),
+    );
+
+    let mut frame = new_default_frame(video, None);
+
+    let src = (0..3).map(|i| {
+        let comp: PlanarImageComponent = i.into();
+        let (stride, height) = pic.plane_data_geometry(comp);
+        unsafe {
+            std::slice::from_raw_parts(
+                pic.plane_data_ptr(comp) as *const u8,
+                (stride * height) as usize,
+            )
+        }
+    });
+    let linesizes = (0..3).map(|i| pic.stride(i.into()) as usize);
+
+    frame.copy_from_slice(src, linesizes);
+    frame
+}
+
+#[no_mangle]
+unsafe extern "C" fn cleanup_user_data(data: *const u8, _: *mut ::std::os::raw::c_void) {
+    Box::from_raw(data as *mut u8);
+}
+
+impl<P> Decoder<P> {
     pub fn new() -> Self {
         unsafe {
             let mut settings = mem::MaybeUninit::uninit();
@@ -63,6 +119,7 @@ impl Decoder {
 
             Decoder {
                 dec: dec.assume_init(),
+                private_data: PhantomData,
             }
         }
     }
@@ -73,12 +130,13 @@ impl Decoder {
         }
     }
 
-    pub fn send_data<T: AsRef<[u8]>>(
+    pub fn send_data<T: AsRef<[u8]>, O: Into<Option<P>>>(
         &mut self,
         buf: T,
         offset: Option<i64>,
         timestamp: Option<i64>,
         duration: Option<i64>,
+        private_data: O,
     ) -> Result<(), Error> {
         let buf = buf.as_ref();
         let len = buf.len();
@@ -95,6 +153,11 @@ impl Decoder {
             if let Some(duration) = duration {
                 data.m.duration = duration;
             }
+            let priv_data = private_data
+                .into()
+                .map(|v| Box::into_raw(Box::new(v)))
+                .unwrap_or(ptr::null_mut());
+            data.m.user_data.data = priv_data as *const u8;
             let ret = dav1d_send_data(self.dec, &mut data);
             if ret < 0 {
                 Err(Error(ret))
@@ -104,7 +167,7 @@ impl Decoder {
         }
     }
 
-    pub fn get_picture(&mut self) -> Result<Picture, Error> {
+    pub fn get_picture(&mut self) -> Result<(Picture, Option<Box<P>>), Error> {
         unsafe {
             let mut pic: Dav1dPicture = mem::zeroed();
             let ret = dav1d_get_picture(self.dec, &mut pic);
@@ -113,20 +176,30 @@ impl Decoder {
                 Err(Error(ret))
             } else {
                 let inner = InnerPicture { pic };
-                Ok(Picture {
-                    inner: Arc::new(inner),
-                })
+                let priv_data = if pic.m.user_data.data.is_null() {
+                    None
+                } else {
+                    let p = pic.m.user_data.data as *mut P;
+                    Some(Box::from_raw(p))
+                };
+                Ok((
+                    Picture {
+                        inner: Arc::new(inner),
+                    },
+                    priv_data,
+                ))
             }
         }
     }
 
-    pub fn decode<T: AsRef<[u8]>, F: FnMut()>(
+    pub fn decode<T: AsRef<[u8]>, F: FnMut(), O: Into<Option<P>>>(
         &mut self,
         buf: T,
         offset: Option<i64>,
         timestamp: Option<i64>,
         duration: Option<i64>,
         mut destroy_notify: F,
+        private_data: O,
     ) -> Result<Vec<Picture>, Error> {
         let buf = buf.as_ref();
         let len = buf.len();
@@ -150,6 +223,11 @@ impl Decoder {
             if let Some(duration) = duration {
                 data.m.duration = duration;
             }
+            let priv_data = private_data
+                .into()
+                .map(|v| Box::into_raw(Box::new(v)))
+                .unwrap_or(ptr::null_mut());
+            data.m.user_data.data = priv_data as *const u8;
             let mut pictures: Vec<Picture> = Vec::new();
             while data.sz > 0 {
                 let ret = dav1d_send_data(self.dec, &mut data);
@@ -158,7 +236,7 @@ impl Decoder {
                     return Err(err);
                 }
                 match self.get_picture() {
-                    Ok(p) => pictures.push(p),
+                    Ok(p) => pictures.push(p.0),
                     Err(e) => {
                         if e.is_again() {
                             continue;
@@ -173,13 +251,13 @@ impl Decoder {
     }
 }
 
-impl Drop for Decoder {
+impl<T> Drop for Decoder<T> {
     fn drop(&mut self) {
         unsafe { dav1d_close(&mut self.dec) };
     }
 }
 
-unsafe impl Send for Decoder {}
+unsafe impl Send for Decoder<av_data::timeinfo::TimeInfo> {}
 
 #[derive(Debug)]
 struct InnerPicture {
@@ -367,3 +445,65 @@ impl Drop for SequenceHeader {
         Arc::get_mut(&mut self.seq).unwrap();
     }
 }
+
+#[cfg(feature = "codec-trait")]
+mod decoder_trait {
+    use super::*;
+    use crate::data::frame::ArcFrame;
+    use crate::data::packet::Packet;
+    use crate::data::timeinfo::TimeInfo;
+    use std::sync::Arc;
+
+    struct Des {
+        descr: av_codec::decoder::Descr,
+        // private_data: PhantomData<T>,
+    }
+
+    impl av_codec::decoder::Descriptor for Des {
+        fn create(&self) -> Box<dyn av_codec::decoder::Decoder> {
+            Box::new(Decoder::new())
+        }
+
+        fn describe(&self) -> &av_codec::decoder::Descr {
+            &self.descr
+        }
+    }
+
+    impl av_codec::decoder::Decoder for Decoder<TimeInfo> {
+        fn set_extradata(&mut self, _extra: &[u8]) {
+            // No-op
+        }
+        fn send_packet(&mut self, pkt: &Packet) -> av_codec::error::Result<()> {
+            self.send_data(&pkt.data, None, None, None, pkt.t.clone())
+                .map_err(|_err| unimplemented!())
+        }
+        fn receive_frame(&mut self) -> av_codec::error::Result<ArcFrame> {
+            let (p, t) = self.get_picture()?;
+            let mut f = frame_from_picture(p);
+            f.t = t.map(|b| *b).unwrap();
+            Ok(Arc::new(f))
+        }
+        fn flush(&mut self) -> av_codec::error::Result<()> {
+            unsafe { dav1d_flush(self.dec) }
+            Ok(())
+        }
+        fn configure(&mut self) -> av_codec::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// AV01 Decoder
+    ///
+    /// To be used with [av-codec](https://docs.rs/av-codec) `Context`.
+    pub const AV01_DESCR: &dyn av_codec::decoder::Descriptor = &Des {
+        descr: av_codec::decoder::Descr {
+            codec: "av1",
+            name: "dav1d",
+            desc: "dav1d AV01 decoder",
+            mime: "video/AV01",
+        },
+    };
+}
+
+#[cfg(feature = "codec-trait")]
+pub use self::decoder_trait::AV01_DESCR;

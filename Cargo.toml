@@ -9,8 +9,14 @@ readme = "README.md"
 repository = "https://github.com/rust-av/dav1d-rs"
 version = "0.6.0"
 
+[features]
+default = ["codec-trait"]
+codec-trait = ["av-codec"]
+
 [dependencies]
 dav1d-sys = { version = "0.3.3", path = "dav1d-sys" }
+av-data = { version = "0.3.0" }
+av-codec = { version = "0.2.2", optional = true }
 
 [workspace]
 members = ["dav1d-sys", "tools"]
