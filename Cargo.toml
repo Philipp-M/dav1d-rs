@@ -18,5 +18,11 @@ dav1d-sys = { version = "0.3.3", path = "dav1d-sys" }
 av-data = { version = "0.3.0" }
 av-codec = { version = "0.2.2", optional = true }
 
+[target.armv7-linux-androideabi.dependencies]
+openssl = { version = "*", features = ["vendored"] }
+
+[target.aarch64-linux-android.dependencies]
+openssl = { version = "*", features = ["vendored"] }
+
 [workspace]
 members = ["dav1d-sys", "tools"]

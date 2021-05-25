@@ -6,6 +6,7 @@ nixpkgs.stdenv.mkDerivation {
     clang
     pkgconfig
   ];
-  buildInputs = with nixpkgs; [ glibc_multi dav1d nasm ninja ];
-  LIBCLANG_PATH = "${nixpkgs.llvmPackages.libclang}/lib";
+  # dav1d 
+  buildInputs = with nixpkgs; [ glibc_multi nasm ninja ];
+  LIBCLANG_PATH = "${nixpkgs.llvmPackages.libclang.lib}/lib";
 }
