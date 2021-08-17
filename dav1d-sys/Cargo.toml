@@ -14,6 +14,6 @@ dav1d = "0.2.0"
 
 [build-dependencies]
 bindgen = "0.58.0"
-system-deps = "3.2"
+system-deps = { git = "https://github.com/Philipp-M/system-deps.git", branch = "static-unavailable-fix" }
 
 [dependencies]
